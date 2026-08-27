@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +943,67 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+func TestDuplicateAttributesAreDropped(t *testing.T) {
+	// Browsers keep the first occurrence of a repeated attribute name and ignore
+	// the later ones. Reporting every occurrence let a hostile duplicate be
+	// smuggled past consumers of this package (such as HTML sanitizers) and then
+	// take effect in the browser. Only the first occurrence must survive, and the
+	// comparison must be case-insensitive for the ASCII range.
+	const in = `<a href="/safe" HREF="javascript:alert(1)" onclick="ok()" onCLICK="alert(2)">x</a>`
+
+	z := NewTokenizer(strings.NewReader(in))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("Next: got %v, want StartTagToken", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("attributes: got %d (%v), want 2", len(tok.Attr), tok.Attr)
+	}
+	for _, a := range tok.Attr {
+		if strings.Contains(a.Val, "javascript:") || strings.Contains(a.Val, "alert(2)") {
+			t.Errorf("smuggled duplicate attribute survived tokenization: %s=%q", a.Key, a.Val)
+		}
+	}
+	if got, want := tok.Attr[0].Val, "/safe"; got != want {
+		t.Errorf("first attribute value: got %q, want %q", got, want)
+	}
+	if got, want := tok.Attr[1].Val, "ok()"; got != want {
+		t.Errorf("second attribute value: got %q, want %q", got, want)
+	}
+
+	// The same must hold through the parser and the renderer, which is the path a
+	// sanitizer built on this package takes.
+	doc, err := Parse(strings.NewReader(in))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := Render(&buf, doc); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got := buf.String(); strings.Contains(got, "javascript:") || strings.Contains(got, "alert(2)") {
+		t.Errorf("smuggled duplicate attribute survived parse and render: %s", got)
+	}
+}
