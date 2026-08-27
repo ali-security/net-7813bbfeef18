@@ -1,0 +1,119 @@
+name: Seal Build
+
+# Upstream golang.org/x/net has no GitHub Actions CI (development happens on
+# Gerrit at go.googlesource.com/net). This workflow is authored by Seal to
+# reproduce the published module zip and to run the project's own test suite.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run instead of the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build module zip and run tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # The Seal time-machine proxy does not resolve from GitHub-hosted runners,
+      # so resolution goes through the public proxy. go.mod/go.sum already pin
+      # every dependency to the exact version v0.45.0 was released against and
+      # go.sum is verified on download, so the resolved set is reproducible.
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # The version the module itself declares.
+          go-version-file: "go.mod"
+
+      - name: Show toolchain
+        run: go version
+
+      - name: Download dependencies
+        run: go mod download
+
+      # The published module zip is packed from the module tree. Upstream ships
+      # no .github directory, so this workflow file must not become a member of
+      # the artifact: pack from a copy of the tree with .github removed.
+      - name: Stage module tree for packing
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/modsrc"
+          cp -a . "$RUNNER_TEMP/modsrc/"
+          rm -rf "$RUNNER_TEMP/modsrc/.github"
+
+      # golang.org/x/mod/zip.CreateFromDir is Go's own module-zip
+      # implementation, so it applies the same inclusion rules as the module
+      # proxy (excludes .git/, vendor/ and nested modules).
+      - name: Build the module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/mkzip" "$GITHUB_WORKSPACE/build_output"
+          cat > "$RUNNER_TEMP/mkzip/create_mod.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$RUNNER_TEMP/mkzip"
+          go mod init example.com/mkzip
+          # Pinned: x/mod@latest declares go >= 1.25, which the toolchain this
+          # module builds with (go 1.24.0, from its own go.mod) cannot load.
+          go get golang.org/x/mod@v0.28.0
+          go run ./create_mod.go golang.org/x/net v0.45.0 \
+            "$RUNNER_TEMP/modsrc" "$GITHUB_WORKSPACE/build_output/v0.45.0.zip"
+          unzip -l "$GITHUB_WORKSPACE/build_output/v0.45.0.zip" | tail -20
+
+      - name: Vet build
+        run: go build ./...
+
+      - name: Test
+        run: |
+          set -o pipefail
+          FILTER="${{ inputs.test-filter }}"
+          if [ -n "$FILTER" ]; then
+            go test -v -run "^($(echo "$FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in $FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || {
+                echo "selected test $t never ran"; exit 1; }
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
